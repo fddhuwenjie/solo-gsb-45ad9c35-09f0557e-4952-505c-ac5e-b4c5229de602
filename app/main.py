@@ -31,10 +31,13 @@ from .schemas import (
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
+    WorksheetRequest,
+    WorksheetResponse,
 )
 from .solver import solve
 from .unit_sets import get_store
 from .units import ALIASES, PREFIXES, REGISTRY
+from .worksheet import run_worksheet
 
 
 @asynccontextmanager
@@ -53,8 +56,10 @@ app = FastAPI(
         "/solve 支持用带单位的等式反求一个未知量（未知量须处于一次线性位置），"
         "所有结果均为精确十进制，维度不兼容、未知符号、非法幂、除零、"
         "非法仿射用法、非线性方程、零系数或精度溢出时返回 422。"
+        "/worksheet 可在一次请求内顺序执行 2～5 个求值/反求步骤，"
+        "后续步骤按结果名引用先前步骤，步骤间传递精确数值与绝对温度属性。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
-        "再由三个接口凭标识选用。"
+        "再由四个接口凭标识选用。"
     ),
     lifespan=lifespan,
 )
@@ -263,6 +268,22 @@ def solve_endpoint(req: SolveRequest) -> ConvertResponse:
         unit=canonical(dst.terms),
         dimension=canonical_dim(dst.dim),
     )
+
+
+@app.post(
+    "/worksheet",
+    response_model=WorksheetResponse,
+    responses={422: {"model": ErrorResponse, "description": "任一步骤失败；不返回部分结果"}},
+    summary="按顺序执行的量纲计算工作单（2～5 步，步骤间可引用先前结果）",
+)
+def worksheet_endpoint(req: WorksheetRequest) -> WorksheetResponse:
+    # 单位上下文在工作单开始时构造一次：三种自定义单位来源在此选择其一，
+    # 活动别名也在此刻解析一次，随后所有步骤共用同一版定义（执行期间切换
+    # 别名不影响本工作单）。任一步骤错误均抛 422，不返回部分结果。
+    scope = scope_for_request(
+        req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
+    )
+    return WorksheetResponse(steps=run_worksheet(req, scope))
 
 
 @app.get("/health", summary="健康检查")

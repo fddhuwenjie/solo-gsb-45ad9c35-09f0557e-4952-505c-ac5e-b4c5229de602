@@ -231,6 +231,121 @@ class SolveRequest(CustomUnitsSelectionModel):
         return self
 
 
+class WorksheetStep(BaseModel):
+    """``POST /worksheet`` 中的单个步骤。
+
+    两种步骤恰好出现一种：``formula`` 走公式求值，``equation`` + ``solve_for``
+    走一次线性方程反求。两种参数混给或缺省都使整次请求返回 422。
+    后续步骤可按 ``name`` 引用本步骤结果；``name`` 在整个工作单中唯一，
+    且不得与初始变量重名。
+    """
+
+    name: str = Field(
+        min_length=1,
+        max_length=32,
+        description="本步骤结果名：唯一，后续步骤按此名引用，不得覆盖已有变量",
+    )
+    output_unit: str = Field(
+        min_length=1, max_length=200, description="结果目标单位表达式"
+    )
+    formula: str | None = Field(
+        default=None, min_length=1, max_length=500, description="求值公式（求值步骤）"
+    )
+    equation: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        description="含恰好一个等号的方程（反求步骤）",
+    )
+    solve_for: str | None = Field(
+        default=None, min_length=1, max_length=32, description="待解未知量名称（反求步骤）"
+    )
+
+    @model_validator(mode="after")
+    def _check_exactly_one_step_kind(self) -> "WorksheetStep":
+        is_evaluate = self.formula is not None
+        is_solve = self.equation is not None or self.solve_for is not None
+        if is_evaluate and is_solve:
+            raise ValueError(
+                "formula 与 equation/solve_for 不能同时出现：每个步骤只能是"
+                "公式求值或一次方程反求"
+            )
+        if not is_evaluate and not is_solve:
+            raise ValueError(
+                "每个步骤必须提供 formula（求值）或 equation 与 solve_for（反求）"
+            )
+        if is_solve and (self.equation is None or self.solve_for is None):
+            raise ValueError("反求步骤必须同时提供 equation 与 solve_for")
+        if not _VAR_NAME_RE.match(self.name):
+            raise ValueError(
+                f"结果名 {self.name!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+        if is_solve and not _VAR_NAME_RE.match(self.solve_for):
+            raise ValueError(
+                f"未知量名称 {self.solve_for!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+        if is_solve and self.equation.count("=") != 1:
+            raise ValueError("equation 必须恰好包含一个等号 '='")
+        return self
+
+
+class WorksheetRequest(CustomUnitsSelectionModel):
+    """POST /worksheet 请求体：初始变量 + 2～5 个顺序执行的步骤。"""
+
+    variables: dict[str, Variable] = Field(
+        default_factory=dict,
+        max_length=20,
+        description="初始带单位变量映射（0～20 个，可省略）；步骤结果不得覆盖这些名字",
+    )
+    steps: list[WorksheetStep] = Field(
+        min_length=2,
+        max_length=5,
+        description="按顺序执行的步骤（2～5 个）；后续步骤可按结果名引用先前步骤",
+    )
+
+    @field_validator("variables")
+    @classmethod
+    def _check_variable_names(cls, variables: dict[str, Variable]) -> dict[str, Variable]:
+        for name in variables:
+            if not _VAR_NAME_RE.match(name):
+                raise ValueError(
+                    f"变量名 {name!r} 不合法：须以字母或下划线开头，"
+                    "仅含字母、数字、下划线，长度不超过 32"
+                )
+        return variables
+
+    @model_validator(mode="after")
+    def _check_step_names_unique_and_not_overriding(self) -> "WorksheetRequest":
+        names: set[str] = set(self.variables)
+        for step in self.steps:
+            if step.name in names:
+                raise ValueError(
+                    f"结果名 {step.name!r} 与初始变量或先前步骤结果重名："
+                    "步骤不能引用未执行步骤，也不能覆盖已有变量"
+                )
+            names.add(step.name)
+        return self
+
+
+class WorksheetStepResult(BaseModel):
+    """单个步骤的结果。"""
+
+    name: str = Field(description="该步骤的结果名")
+    value: str = Field(description="换算结果的精确十进制表示")
+    unit: str = Field(description="目标单位表达式的规范形式")
+    dimension: str = Field(description="规范量纲表达式（SI 基本单位）")
+
+
+class WorksheetResponse(BaseModel):
+    """POST /worksheet 的成功响应：各步骤按提交顺序给出结果。"""
+
+    steps: list[WorksheetStepResult] = Field(
+        description="各步骤结果（顺序与提交一致），供核对完整计算过程"
+    )
+
+
 class ConvertResponse(BaseModel):
     """POST /convert、POST /evaluate 与 POST /solve 的成功响应。"""
 
