@@ -27,6 +27,7 @@ from fractions import Fraction
 from typing import Mapping
 
 from .config import MAX_POWER, MAX_PRECISION
+from .converter import convert_fraction
 from .errors import (
     affine_mixing,
     dimension_mismatch,
@@ -39,7 +40,7 @@ from .errors import (
     unknown_variable,
 )
 from .evaluator import MAX_NESTING, Quantity, _TOKEN_RE
-from .parser import canonical_dim
+from .parser import ParsedExpression, canonical_dim
 from .units import DIMLESS
 
 
@@ -309,3 +310,26 @@ def solve(
     value = const.value_si / coef.value_si
     dim = tuple(c - k for c, k in zip(const.dim, coef.dim))
     return value, dim
+
+
+def convert_solution(
+    value_si: Fraction, dim: tuple[int, ...] | None, dst: ParsedExpression
+) -> tuple[Fraction, Quantity]:
+    """把反求结果换算到线性目标单位。
+
+    返回 ``(目标口径精确分数, 供后续引用的 SI 口径量)``。规则与
+    ``POST /solve`` 完全一致：目标单位不能是绝对温标（degC/degF）；
+    解恒为零且量纲不受方程约束（``dim is None``，如 ``2*x = x``）时接受任意
+    线性目标单位，供后续引用的量按目标量纲存储（值为 0）。反求结果恒为
+    线性量（``absolute`` 恒为 False）。
+    """
+
+    if dst.affine is not None:
+        raise affine_mixing(
+            "求解结果只能换算到线性单位，不能换算到绝对温标（degC/degF）"
+        )
+    if dim is None:
+        return Fraction(0), Quantity(Fraction(0), dst.dim)
+    src = ParsedExpression(dim=dim, scale=Fraction(1), terms=())
+    value_fr = convert_fraction(value_si, src, dst)
+    return value_fr, Quantity(value_si, dim)

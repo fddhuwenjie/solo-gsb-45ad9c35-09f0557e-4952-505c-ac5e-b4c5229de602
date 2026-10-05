@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -159,6 +159,22 @@ class Variable(BaseModel):
 _VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
 
 
+def _check_names(names: Iterable[str], *, label: str) -> None:
+    """校验变量/结果名：须以字母或下划线开头，仅含字母、数字、下划线（≤32）。"""
+
+    for name in names:
+        if not _VAR_NAME_RE.match(name):
+            raise ValueError(
+                f"{label} {name!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+
+
+def validate_variable_names(variables: dict[str, Variable]) -> dict[str, Variable]:
+    _check_names(variables, label="变量名")
+    return variables
+
+
 class EvaluateRequest(CustomUnitsSelectionModel):
     """POST /evaluate 请求体。"""
 
@@ -171,13 +187,7 @@ class EvaluateRequest(CustomUnitsSelectionModel):
     @field_validator("variables")
     @classmethod
     def _check_variable_names(cls, variables: dict[str, Variable]) -> dict[str, Variable]:
-        for name in variables:
-            if not _VAR_NAME_RE.match(name):
-                raise ValueError(
-                    f"变量名 {name!r} 不合法：须以字母或下划线开头，"
-                    "仅含字母、数字、下划线，长度不超过 32"
-                )
-        return variables
+        return validate_variable_names(variables)
 
 
 class SolveRequest(CustomUnitsSelectionModel):
@@ -199,13 +209,7 @@ class SolveRequest(CustomUnitsSelectionModel):
     @field_validator("variables")
     @classmethod
     def _check_variable_names(cls, variables: dict[str, Variable]) -> dict[str, Variable]:
-        for name in variables:
-            if not _VAR_NAME_RE.match(name):
-                raise ValueError(
-                    f"变量名 {name!r} 不合法：须以字母或下划线开头，"
-                    "仅含字母、数字、下划线，长度不超过 32"
-                )
-        return variables
+        return validate_variable_names(variables)
 
     @field_validator("equation")
     @classmethod
@@ -229,6 +233,127 @@ class SolveRequest(CustomUnitsSelectionModel):
         if self.solve_for in self.variables:
             raise ValueError(f"solve_for {self.solve_for!r} 不得出现在 variables 中")
         return self
+
+
+class WorksheetStep(BaseModel):
+    """POST /worksheet 中的单个步骤：公式求值或一次线性方程反求。
+
+    两种步骤恰好二选一：
+
+    - 求值步骤：提供 ``formula``（不得提供 ``equation``/``solve_for``），
+      语义与 POST /evaluate 一致；
+    - 反求步骤：同时提供 ``equation`` 与 ``solve_for``（不得提供 ``formula``），
+      语义与 POST /solve 一致。
+    """
+
+    result: str = Field(
+        min_length=1,
+        max_length=32,
+        description="本步结果的唯一名；后续步骤凭此名引用，不得覆盖初始变量或先前结果",
+    )
+    output_unit: str = Field(
+        min_length=1, max_length=200, description="本步结果的目标单位表达式"
+    )
+    formula: str | None = Field(
+        default=None, min_length=1, max_length=500, description="求值公式（求值步骤）"
+    )
+    equation: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        description="含恰好一个等号的方程（反求步骤）",
+    )
+    solve_for: str | None = Field(
+        default=None, min_length=1, max_length=32, description="待解未知量名称（反求步骤）"
+    )
+
+    @field_validator("result", "solve_for")
+    @classmethod
+    def _check_name(cls, name: str | None) -> str | None:
+        if name is not None and not _VAR_NAME_RE.match(name):
+            raise ValueError(
+                f"名称 {name!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+        return name
+
+    @field_validator("equation")
+    @classmethod
+    def _check_single_equals(cls, equation: str | None) -> str | None:
+        if equation is not None and equation.count("=") != 1:
+            raise ValueError("equation 必须恰好包含一个等号 '='")
+        return equation
+
+    @property
+    def is_solve(self) -> bool:
+        """是否为反求步骤（同时携带 equation 与 solve_for）。"""
+
+        return self.equation is not None
+
+    @model_validator(mode="after")
+    def _check_exactly_one_step_kind(self) -> "WorksheetStep":
+        if self.formula is not None:
+            if self.equation is not None or self.solve_for is not None:
+                raise ValueError(
+                    "formula 与 equation/solve_for 不能同时出现："
+                    "每个步骤必须恰好是求值或反求之一"
+                )
+        elif self.equation is None or self.solve_for is None:
+            raise ValueError(
+                "每个步骤必须提供求值内容 formula，或同时提供反求内容 equation 与 solve_for"
+            )
+        return self
+
+
+class WorksheetRequest(CustomUnitsSelectionModel):
+    """POST /worksheet 请求体：初始变量与 2～5 个按顺序执行的步骤。"""
+
+    variables: dict[str, Variable] = Field(
+        default_factory=dict,
+        max_length=20,
+        description="初始带单位变量（0～20 个，可省略）；后续步骤可按名引用，"
+        "步骤结果名不得与初始变量重名",
+    )
+    steps: list[WorksheetStep] = Field(
+        min_length=2, max_length=5, description="按顺序执行的步骤（2～5 个）"
+    )
+
+    @field_validator("variables")
+    @classmethod
+    def _check_variable_names(cls, variables: dict[str, Variable]) -> dict[str, Variable]:
+        return validate_variable_names(variables)
+
+    @model_validator(mode="after")
+    def _check_step_names(self) -> "WorksheetRequest":
+        taken = set(self.variables)
+        for index, step in enumerate(self.steps):
+            if step.result in taken:
+                raise ValueError(
+                    f"第 {index + 1} 步结果名 {step.result!r} 已被初始变量或先前步骤占用，"
+                    "不能覆盖已有变量"
+                )
+            if step.is_solve and step.solve_for in taken:
+                raise ValueError(
+                    f"第 {index + 1} 步的 solve_for {step.solve_for!r} "
+                    "不得是初始变量或先前步骤的结果名"
+                )
+            taken.add(step.result)
+        return self
+
+
+class WorksheetStepResult(BaseModel):
+    """POST /worksheet 单个步骤的结果。"""
+
+    result: str = Field(description="该步骤提交的结果名")
+    value: str = Field(description="该步骤结果的精确十进制表示")
+    unit: str = Field(description="目标单位表达式的规范形式")
+    dimension: str = Field(description="规范量纲表达式（SI 基本单位）")
+
+
+class WorksheetResponse(BaseModel):
+    """POST /worksheet 的成功响应：各步骤结果，顺序与提交一致。"""
+
+    steps: list[WorksheetStepResult] = Field(description="各步骤的 value/unit/dimension")
 
 
 class ConvertResponse(BaseModel):

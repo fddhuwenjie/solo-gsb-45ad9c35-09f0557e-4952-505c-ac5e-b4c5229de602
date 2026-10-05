@@ -3,23 +3,17 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from fractions import Fraction
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .converter import (
-    convert,
-    convert_fraction,
-    is_absolute_target,
-    to_decimal_str,
-)
+from .converter import convert, to_decimal_str
 from .custom_units import scope_for_request
-from .errors import AliasConflictError, ConversionError, affine_mixing
-from .evaluator import evaluate, make_quantity
-from .parser import ParsedExpression, canonical, canonical_dim, parse_expression
+from .errors import AliasConflictError, ConversionError
+from .evaluator import convert_quantity, evaluate, make_quantity
+from .parser import canonical, canonical_dim, parse_expression
 from .schemas import (
     BindUnitSetAliasRequest,
     ConvertRequest,
@@ -31,10 +25,14 @@ from .schemas import (
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
+    WorksheetRequest,
+    WorksheetResponse,
+    WorksheetStepResult,
 )
-from .solver import solve
+from .solver import convert_solution, solve
 from .unit_sets import get_store
 from .units import ALIASES, PREFIXES, REGISTRY
+from .worksheet import run_worksheet
 
 
 @asynccontextmanager
@@ -51,10 +49,11 @@ app = FastAPI(
         "解析单位表达式（乘、除、整数幂），规范化量纲，支持 SI 词头与"
         "摄氏/华氏/开尔文仿射温标；/evaluate 支持带单位的变量公式求值，"
         "/solve 支持用带单位的等式反求一个未知量（未知量须处于一次线性位置），"
+        "/worksheet 支持一次请求内按顺序执行 2～5 个求值/反求步骤并引用先前结果，"
         "所有结果均为精确十进制，维度不兼容、未知符号、非法幂、除零、"
         "非法仿射用法、非线性方程、零系数或精度溢出时返回 422。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
-        "再由三个接口凭标识选用。"
+        "再由各计算接口凭标识或活动别名选用。"
     ),
     lifespan=lifespan,
 )
@@ -208,21 +207,7 @@ def evaluate_endpoint(req: EvaluateRequest) -> ConvertResponse:
     }
     result = evaluate(req.formula, quantities)
     dst = parse_expression(req.output_unit, scope)
-
-    if result.absolute:
-        # 绝对温标变量作为公式唯一项：走仿射换算路径
-        if not is_absolute_target(dst):
-            raise affine_mixing(
-                "绝对温度结果只能换算到绝对温标（degC/degF/K），"
-                "不能换算到温差单位或复合单位"
-            )
-        src = ParsedExpression(dim=result.dim, scale=Fraction(1), terms=(("K", 1),))
-        value_fr = convert_fraction(result.value_si, src, dst)
-    else:
-        # 线性量（含温差）：以 SI 基单位口径构造源表达式
-        src = ParsedExpression(dim=result.dim, scale=Fraction(1), terms=())
-        value_fr = convert_fraction(result.value_si, src, dst)
-
+    value_fr, _ = convert_quantity(result, dst)
     return ConvertResponse(
         value=to_decimal_str(value_fr),
         unit=canonical(dst.terms),
@@ -247,21 +232,38 @@ def solve_endpoint(req: SolveRequest) -> ConvertResponse:
     }
     value_si, dim = solve(req.equation, req.solve_for, quantities)
     dst = parse_expression(req.output_unit, scope)
-    if dst.affine is not None:
-        raise affine_mixing(
-            "求解结果只能换算到线性单位，不能换算到绝对温标（degC/degF）"
-        )
-    if dim is None:
-        # 解恒为零且量纲不受方程约束（如 2*x = x）：接受任意线性目标单位
-        value_fr = Fraction(0)
-    else:
-        # 线性量：以 SI 基单位口径构造源表达式
-        src = ParsedExpression(dim=dim, scale=Fraction(1), terms=())
-        value_fr = convert_fraction(value_si, src, dst)
+    value_fr, _ = convert_solution(value_si, dim, dst)
     return ConvertResponse(
         value=to_decimal_str(value_fr),
         unit=canonical(dst.terms),
         dimension=canonical_dim(dst.dim),
+    )
+
+
+@app.post(
+    "/worksheet",
+    response_model=WorksheetResponse,
+    responses={422: {"model": ErrorResponse, "description": "任一步骤失败，整单无结果"}},
+    summary="按顺序执行的量纲计算工作单（2～5 步，可引用先前步骤结果）",
+)
+def worksheet_endpoint(req: WorksheetRequest) -> WorksheetResponse:
+    # 别名/定义集在此解析一次并构造同一 scope：整个工作单（初始变量、各步单位）
+    # 都使用该版定义，执行期间别名被切换也不会跨版本混用
+    scope = scope_for_request(
+        req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
+    )
+    outputs = run_worksheet(req.variables, req.steps, scope)
+    # 任一步失败都会在 run_worksheet 内抛出 422，不会返回部分结果
+    return WorksheetResponse(
+        steps=[
+            WorksheetStepResult(
+                result=out.name,
+                value=to_decimal_str(out.value_fr),
+                unit=canonical(out.dst.terms),
+                dimension=canonical_dim(out.dst.dim),
+            )
+            for out in outputs
+        ]
     )
 
 

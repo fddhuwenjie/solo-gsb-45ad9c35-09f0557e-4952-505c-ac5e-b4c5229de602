@@ -31,7 +31,7 @@ from fractions import Fraction
 from typing import Mapping
 
 from .config import MAX_POWER, MAX_PRECISION
-from .converter import is_absolute_temperature
+from .converter import convert_fraction, is_absolute_target, is_absolute_temperature
 from .errors import (
     ConversionError,
     affine_mixing,
@@ -274,3 +274,33 @@ def evaluate(formula: str, variables: Mapping[str, Quantity]) -> Quantity:
     except ZeroDivisionError:
         # Fraction 在极端组合下仍可能直接抛出（如 0 的负幂被先行拦截外的情形）
         raise division_by_zero() from None
+
+
+def convert_quantity(
+    result: Quantity, dst: ParsedExpression
+) -> tuple[Fraction, Quantity]:
+    """把求值结果（SI 口径）换算到目标单位。
+
+    返回 ``(目标口径精确分数, 供后续引用的 SI 口径量)``：前者用于渲染该步
+    ``value``，后者是把结果作为变量传递给后续步骤时的精确表示（保留
+    ``absolute`` 绝对温度标记）。规则与 ``POST /evaluate`` 完全一致：
+    绝对温度结果只能换算到合法绝对温标（裸 degC/degF/K）；线性量（含温差）
+    按线性比例换算。十进制精度在调用方渲染时再校验（见
+    :func:`to_decimal_str`）。
+    """
+
+    if result.absolute:
+        if not is_absolute_target(dst):
+            raise affine_mixing(
+                "绝对温度结果只能换算到绝对温标（degC/degF/K），"
+                "不能换算到温差单位或复合单位"
+            )
+        src = ParsedExpression(dim=result.dim, scale=Fraction(1), terms=(("K", 1),))
+        value_fr = convert_fraction(result.value_si, src, dst)
+    else:
+        # 线性量（含温差）：以 SI 基单位口径构造源表达式
+        src = ParsedExpression(dim=result.dim, scale=Fraction(1), terms=())
+        value_fr = convert_fraction(result.value_si, src, dst)
+    # 后续步骤按 SI 口径的原始结果引用：数值与绝对温度属性原样传递，
+    # 与目标单位选择无关（value_fr 仅用于该步展示）
+    return value_fr, result

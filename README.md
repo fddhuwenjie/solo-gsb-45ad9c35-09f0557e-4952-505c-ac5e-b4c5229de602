@@ -2,20 +2,22 @@
 
 基于 **Python + FastAPI + Pydantic** 的单位换算服务：解析单位表达式（乘、除、整数幂），
 规范化量纲，支持 SI 词头与摄氏/华氏/开尔文仿射温标；`/evaluate` 支持对带单位的变量
-公式做量纲感知的求值，`/solve` 支持用带单位的等式反求一个未知量。所有结果均为**精确十进制**。
+公式做量纲感知的求值，`/solve` 支持用带单位的等式反求一个未知量，`/worksheet` 支持
+一次请求内按顺序执行 2～5 个求值/反求步骤并引用先前步骤的结果。所有结果均为**精确十进制**。
 
 ## 特性
 
 - **表达式解析**：`kg*m/s^2`、`km/h`、`(m/s)^2`、`J/(kg*K)`，支持 `*`、`/`、`^`（或 `**`）、括号与整数幂
 - **变量公式求值（`POST /evaluate`）**：1～20 个带 `value`/`unit` 的变量 + 公式（变量、十进制定值、`+ - * /`、括号、整数幂），解析时以 `Fraction` 同步合并数值与量纲，结果精确换算到 `output_unit`
 - **等式求解（`POST /solve`）**：用带单位的等式反求未知量：两侧以 `Fraction` 同步构建未知量的一次系数与常数项并校验量纲，支持 `+ - * /`、括号与纯常数幂，解精确换算到线性的 `output_unit`
+- **量纲计算工作单（`POST /worksheet`）**：一次 HTTP 请求提交初始带单位变量与 **2～5 个按顺序执行的步骤**；每步给出唯一结果名、目标单位，以及公式求值或一次线性方程反求所需内容；后续步骤可按结果名引用先前结果，步骤间传递**精确数值与绝对温度属性**，任一步错误整单返回 422 且不返回部分结果
 - **量纲规范化**：输出规范单位表达式与 SI 基本量纲表达式，相同输入永远产生相同输出
 - **SI 词头**：`Y Z E P T G M k h da d c m u µ n p f a z y`（如 `km`、`mV`、`µm`）
 - **仿射温标**：`degC`（°C）、`degF`（°F）、`K` 互为绝对温度换算；温差单位 `dC`/`dF`/`dK` 严格隔离，**禁止温差与绝对温度混算**；公式中的绝对温标变量只能作为唯一项
 - **精确十进制**：内部使用有理数精确运算；结果不能表示为有限十进制或超过精度上限时返回 422，绝不输出舍入值
-- **请求级自定义单位**：三个接口均可携带 1～6 项 `custom_units`（`symbol`/正十进制 `factor`/`base_unit`，含义为 `1 symbol = factor 个 base_unit`），支持前向引用与链式定义；自定义符号不与内置单位/词头冲突、不自动获得词头、不能引用 `degC`/`degF`/裸 `K`，且仅在本次请求内有效（不修改全局单位表，并发安全）
-- **可复用定义集发布（`POST /custom-unit-sets`）**：把 1～6 项已按上述规则校验并展开的定义发布为**可复用定义集**，服务生成不可猜测的标识；已发布内容不可修改，三个接口可凭 `custom_unit_set_id` 选用（与请求内 `custom_units` 互斥），定义落盘保存，**容器重建后仍可使用**
-- **活动别名（`GET`/`PUT /custom-unit-set-aliases`）**：为已发布的不可变定义集设置一个长期不变的**别名**：调用方始终沿用同一名称，维护者把别名切换到新发布的定义集。切换采用乐观并发（`expected_id`，初建为 `null`）：当前指向不一致返回 **409**、目标不存在返回 **422**，均不改写原指向；别名在请求开始时解析一次，三个接口可传 `custom_unit_set_alias`（与 `custom_units`、`custom_unit_set_id` 互斥），与定义集共同落盘，**容器重建后仍有效**
+- **请求级自定义单位**：各计算接口（`/convert`、`/evaluate`、`/solve`、`/worksheet`）均可携带 1～6 项 `custom_units`（`symbol`/正十进制 `factor`/`base_unit`，含义为 `1 symbol = factor 个 base_unit`），支持前向引用与链式定义；自定义符号不与内置单位/词头冲突、不自动获得词头、不能引用 `degC`/`degF`/裸 `K`，且仅在本次请求内有效（不修改全局单位表，并发安全）
+- **可复用定义集发布（`POST /custom-unit-sets`）**：把 1～6 项已按上述规则校验并展开的定义发布为**可复用定义集**，服务生成不可猜测的标识；已发布内容不可修改，各计算接口可凭 `custom_unit_set_id` 选用（与请求内 `custom_units` 互斥），定义落盘保存，**容器重建后仍可使用**
+- **活动别名（`GET`/`PUT /custom-unit-set-aliases`）**：为已发布的不可变定义集设置一个长期不变的**别名**：调用方始终沿用同一名称，维护者把别名切换到新发布的定义集。切换采用乐观并发（`expected_id`，初建为 `null`）：当前指向不一致返回 **409**、目标不存在返回 **422**，均不改写原指向；别名在请求开始时解析一次（工作单则整个工作单只解析一次），各计算接口可传 `custom_unit_set_alias`（与 `custom_units`、`custom_unit_set_id` 互斥），与定义集共同落盘，**容器重建后仍有效**
 - **统一 422**：维度不兼容、未知变量/符号、非法幂、除零、非法仿射用法、非线性方程、零系数、精度溢出均返回 422 且不产出结果
 
 ## 快速开始
@@ -93,7 +95,7 @@ curl -X POST http://localhost:8000/convert \
 {"value": "1",    "from": "s^-2*kg*m","to": "N"}        -> {"value": "1",     "unit": "N",    "dimension": "kg*m/s^2"}
 ```
 
-### 请求级自定义单位（三个接口通用）
+### 请求级自定义单位（各计算接口通用）
 
 请求体可携带 `custom_units`，每项为 `{"symbol", "factor", "base_unit"}`，
 含义为 **1 symbol = factor 个 base_unit**（`factor` 为正十进制数，建议用字符串传递）。
@@ -257,7 +259,7 @@ curl -X POST http://localhost:8000/solve \
 ```
 
 **选用规则**：`custom_units` 与 `custom_unit_set_id` 互斥，同时出现整次请求
-返回 422；二者都缺省时三个接口保持原有行为（三种来源 `custom_units` /
+返回 422；二者都缺省时各接口保持原有行为（三种来源 `custom_units` /
 `custom_unit_set_id` / `custom_unit_set_alias` 的完整选用规则见下文
 [“为已发布定义集设置活动别名”](#为已发布定义集设置活动别名切换实际定义而不改调用方名称)
 一节）。
@@ -347,7 +349,8 @@ PUT /custom-unit-set-aliases/lengths
 # 422 {"detail":{"error":"invalid_request","message":"别名 'lengths' 无法绑定到不存在的定义集: ……"}}
 ```
 
-**用别名调用三个计算接口**：在 `/convert`、`/evaluate`、`/solve` 请求体中传
+**用别名调用各计算接口**：在 `/convert`、`/evaluate`、`/solve`（以及
+`/worksheet`，整个工作单只解析一次）请求体中传
 `custom_unit_set_alias` 即可。别名在**请求开始时解析一次**，本次请求的源、目标与
 变量单位始终使用解析到的那一版定义；即使别名在请求处理过程中被切换，本次请求也会
 **完整使用旧版或新版**，不会跨版本混用。别名不存在整次请求返回 **422**。
@@ -385,7 +388,7 @@ curl -X POST http://localhost:8000/solve \
 | 只有 `custom_unit_set_id`            | 直接按该已发布定义集解析（原有行为）；标识不存在返回 422          |
 | 只有 `custom_unit_set_alias`         | 请求开始解析一次别名并全程使用该版定义；**别名不存在返回 422**    |
 | 三者中任意两个（或三个）同时出现     | **整次请求返回 422**（一次调用只能使用一种自定义单位来源）        |
-| 三者都不带                           | 三个接口保持原有行为与响应，不使用任何自定义单位                  |
+| 三者都不带                           | 各接口保持原有行为与响应，不使用任何自定义单位                  |
 
 - 切换别名与落盘**共同生效**：内存指向更新与 JSON 原子写盘在同一临界区完成，
   写盘失败会回滚进程内指向（不改变原指向）后返回错误；
@@ -551,10 +554,104 @@ curl -X POST http://localhost:8000/solve \
 - 除零返回 422 `division_by_zero`；解不是有限十进制或超过精度上限返回 422 `precision_overflow`
 - 解恒为零且量纲不受方程约束时（如 `2*x = x`），接受任意线性目标单位，结果为 `0`
 
+### `POST /worksheet`
+
+一次 HTTP 请求提交一张**量纲计算工作单**：初始带单位变量（0～20 个，可省略）与
+**2～5 个按顺序执行的步骤**。每步给出唯一结果名 `result`、目标单位 `output_unit`，
+以及下列二者之一：
+
+- **求值步骤**：`formula`（语义、量纲、仿射与精度规则与 `/evaluate` 完全一致）；
+- **反求步骤**：`equation` + `solve_for`（规则与 `/solve` 完全一致，`solve_for`
+  不得是初始变量或先前步骤的结果名）。
+
+请求体同样支持 `custom_units` / `custom_unit_set_id` / `custom_unit_set_alias`
+三种自定义单位来源（两两互斥，规则与上文一致）。
+
+| 字段        | 类型   | 说明 |
+| ----------- | ------ | ---- |
+| `variables` | 对象（可省略） | 0～20 个初始带单位变量，格式同 `/evaluate`；步骤结果名不得与之重名 |
+| `steps`     | 数组   | **2～5** 个步骤，按数组顺序执行 |
+| `steps[].result` | 字符串 | 本步结果的唯一名（变量名词法，≤32 字符）；不得覆盖初始变量或先前结果 |
+| `steps[].output_unit` | 字符串 | 本步结果的目标单位表达式（反求步骤须为线性单位） |
+| `steps[].formula` | 字符串 | 求值公式（与 `/evaluate` 相同）；与 `equation`/`solve_for` 二选一 |
+| `steps[].equation` | 字符串 | 含恰好一个等号的方程（与 `/solve` 相同），与 `solve_for` 同时提供 |
+| `steps[].solve_for` | 字符串 | 反求步骤的待解未知量名；不得是初始变量或先前结果名 |
+
+成功响应 `200` 返回 `steps` 数组（顺序与提交一致），每步含 `result`、
+`value`（精确十进制字符串）、`unit`（规范目标单位）、`dimension`（SI 基本量纲）。
+
+```bash
+curl -X POST http://localhost:8000/worksheet \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {
+      "v":  {"value": "60", "unit": "km/h"},
+      "t":  {"value": "2",  "unit": "h"},
+      "v2": {"value": "30", "unit": "km/h"}
+    },
+    "steps": [
+      {"result": "s",  "formula": "v*t",             "output_unit": "km"},
+      {"result": "t2", "equation": "v2*t2 = s", "solve_for": "t2", "output_unit": "h"},
+      {"result": "avg", "formula": "(s+s)/(t+t2)",   "output_unit": "km/h"}
+    ]
+  }'
+```
+
+```json
+{
+  "steps": [
+    {"result": "s",   "value": "120", "unit": "km",    "dimension": "m"},
+    {"result": "t2",  "value": "4",   "unit": "h",     "dimension": "s"},
+    {"result": "avg", "value": "40",  "unit": "km/h",  "dimension": "m/s"}
+  ]
+}
+```
+
+先求值路程 `s = v*t = 120 km`，再反求时间 `t2 = s/v2 = 4 h`，
+最后引用两者求平均速度 `(s+s)/(t+t2) = 40 km/h`。
+
+绝对温度属性在步骤间原样传递：第一步把华氏度作为唯一项换算到开尔文，
+第二步仍可把它作为绝对温度换算到摄氏度；一旦绝对温度参与任何运算即按现有
+规则返回 422 `affine_mixing`。
+
+```bash
+curl -X POST http://localhost:8000/worksheet \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {"T": {"value": "98.6", "unit": "degF"}},
+    "steps": [
+      {"result": "Tk", "formula": "T",  "output_unit": "K"},
+      {"result": "Tc", "formula": "Tk", "output_unit": "degC"}
+    ]
+  }'
+# {"steps":[{"result":"Tk","value":"310.15","unit":"K","dimension":"K"},
+#           {"result":"Tc","value":"37","unit":"degC","dimension":"K"}]}
+```
+
+**工作单规则**：
+
+- 步骤严格按顺序执行：后续步骤的公式/方程可引用初始变量与**先前**步骤的结果名；
+  引用尚未执行的步骤返回 422 `unknown_variable`
+- 结果名必须唯一：不得覆盖初始变量或已有步骤结果；反求步骤的 `solve_for`
+  也不得是已有名称（但允许它与本步或后续步骤的结果名同名），违反返回 422
+  `invalid_request`
+- 步骤之间传递的是 **SI 基单位口径的精确 `Fraction` 数值与绝对温度标记**，
+  不是渲染后的字符串：选择什么 `output_unit` 只影响该步展示，不影响后续计算精度；
+  各步 `value` 仍受有限十进制/50 位有效数字上限约束，任一步无法精确表示即整单
+  422 `precision_overflow`
+- 求值步骤沿用 `/evaluate` 的量纲与仿射规则（绝对温标只能作唯一项），
+  反求步骤沿用 `/solve` 的全部规则（未知量须一次线性、目标单位须线性、零系数报错等）
+- **任一步骤失败都返回 422 且不返回部分结果**；初始变量单位在任何步骤执行前解析，
+  未知符号同样使整单失败
+- 自定义单位来源与其他接口相同：请求内 `custom_units`、`custom_unit_set_id`、
+  `custom_unit_set_alias` 两两互斥；**别名在整个工作单只解析一次**——即使工作单
+  执行期间别名被切换，初始变量单位与全部步骤单位也都使用同一版定义，绝不跨版本混用
+
 ### 其他端点
 
 | 端点         | 说明                             |
 | ------------ | -------------------------------- |
+| `POST /worksheet` | 一次请求内按顺序执行 2～5 个求值/反求步骤，后续步骤可引用先前结果 |
 | `POST /custom-unit-sets` | 发布 1～6 项自定义单位定义为可复用定义集，返回服务生成标识（201） |
 | `GET /custom-unit-set-aliases` | 列出全部活动别名及其当前指向的定义集标识 |
 | `GET /custom-unit-set-aliases/{alias}` | 查询单个活动别名当前指向（不存在返回 422） |
@@ -604,7 +701,8 @@ PRIMARY:= "(" expr ")" | VARIABLE | DECIMAL
 - 绝对温度与温差互转（如 `degC -> dK`、`dC -> degC`）返回 422
 - `K` 是中性的：既可参与绝对温度换算，也可与温差单位换算
 - 在 `/evaluate` 中：单位为裸 `degC`/`degF`/`K` 的变量属于**绝对温标变量**，只能作为公式唯一项（`T` 或 `(T)`）；温差变量（`dC`/`dF`/`dK`、`mK` 等）可正常线性运算
-- 在 `/solve` 中：绝对温标变量不能出现在等式中；温差变量可正常参与求解；目标单位须为线性单位
+- 在 `/solve` 与 `/worksheet` 的反求步骤中：绝对温标变量不能出现在等式中；温差变量可正常参与求解；目标单位须为线性单位
+- 在 `/worksheet` 中：绝对温度结果作为后续步骤的唯一项引用时仍按绝对温度处理（可继续仿射换算）；一旦参与任何运算即按 `/evaluate` 规则返回 422；反求步骤的结果恒为线性量
 - 别名：`°C`→`degC`，`°F`→`degF`
 
 ## 支持的单位
@@ -665,6 +763,7 @@ app/
   parser.py     # 单位表达式解析器（递归下降）与规范化输出
   evaluator.py  # 公式求值器（Fraction 数值/量纲合并、温标规则）
   solver.py     # 等式求解器（未知量一次系数/常数的 Fraction 构建与量纲校验）
+  worksheet.py  # 工作单：2～5 个求值/反求步骤顺序执行，步骤间传递精确量与绝对温度标记
   units.py      # 单位注册表、SI 词头与别名
   custom_units.py  # 请求级自定义单位（custom_units）：冲突/循环/禁引校验与链式解析，三种来源选择
   unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、线程安全与 JSON 落盘/重载
@@ -675,7 +774,8 @@ tests/
   test_api.py       # /convert 端到端测试
   test_evaluate.py  # /evaluate 端到端测试
   test_solve.py     # /solve 端到端测试
-  test_custom_units.py  # 请求级自定义单位（三个接口）端到端测试
+  test_custom_units.py  # 请求级自定义单位（各计算接口）端到端测试
+  test_worksheet.py     # /worksheet 顺序执行/跨步骤精确值与绝对温度传递/引用覆盖规则/错误整单 422/三种单位来源测试
   test_unit_sets.py     # 可复用定义集发布/选用/互斥/隔离/不可变/持久化测试
   test_unit_set_aliases.py  # 活动别名查询/切换（409/422）/三接口选用/并发一致性/持久化与旧文件兼容测试
 Dockerfile
